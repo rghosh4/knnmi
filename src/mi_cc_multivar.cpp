@@ -1,25 +1,27 @@
-// mi_cc_multivar.cpp
+// mi_cc_multivar.cpp  (v3 simplified)
 //
-// Multivariate mutual information: MI(X; Y) where X is d_x-dimensional
-// and Y is d_y-dimensional.
+// Multivariate MI: MI(X; Y) where X is d_x-dim, Y is d_y-dim.
 //
-// This extends knnmi's MutualInformation::compute() (which handles only
-// the 1D vs 1D case) to arbitrary dimensions. Uses the exact same:
-//   - nanoflann KD-tree with Chebyshev (L-infinity) metric
-//   - nextafter eps-nudging trick
-//   - radiusSearch for marginal counting (self-inclusive → digamma(count))
-//   - RMS scaling without centering
+// Pure brute-force implementation with true Chebyshev distance.
+// No nanoflann dependency for distance computation — avoids the
+// L1 vs Chebyshev radiusSearch issue entirely.
+//
+// Matches knnmi conventions exactly:
+//   - RMS scale without centering (MutualInformationBase::scale)
 //   - 1e-12 * mean * unif_rand() noise
+//   - k+1 NN search including self
+//   - nextafter(eps, 0) nudge
+//   - radiusSearch-style counting: self included (dist 0 <= eps)
+//   - digamma(count) where count includes self
+//   - MI = psi(k) + psi(N) - <psi(n_x) + psi(n_y)>
+//   - max(0, MI) clamp
 //
-// The only difference: joint space is (d_x + d_y)-dimensional, and
-// marginal Chebyshev distances are computed over d_x or d_y dimensions
-// respectively.
+// O(n^2) — at n=5000 in C++ this takes ~1-3 seconds.
 //
 // Copyright (C) 2026 — extends knnmi (GPL-3)
 
 #include <cmath>
 #include <algorithm>
-#include <numeric>
 #include <vector>
 #include <limits>
 #include <cstdint>
@@ -29,248 +31,176 @@
 #include "Rinternals.h"
 #include <R_ext/Random.h>
 
-#include "nanoflann.hpp"
-
-// We need Eigen for the matrix adapter.
-// knnmi bundles Eigen 3.4.0 in inst/include or similar.
-// Adjust this include path if needed based on the actual knnmi layout.
-#include <eigen3/Eigen/Dense>
-
-using namespace Eigen;
 
 // =============================================================================
-// nanoflann adapter for dynamic-dimension Eigen matrices (Chebyshev metric)
+// Helpers matching knnmi's MutualInformationBase exactly
 // =============================================================================
 
-// Chebyshev (L-infinity) distance metric for nanoflann
-template <class T, class DataSource, typename _DistanceType = T>
-struct ChebyshevDistance {
-    typedef _DistanceType DistanceType;
-    typedef T ElementType;
-
-    const DataSource &data_source;
-
-    ChebyshevDistance(const DataSource &_data_source) : data_source(_data_source) {}
-
-    inline DistanceType evalMetric(const T *a, const size_t b_idx, size_t size) const {
-        DistanceType result = DistanceType();
-        for (size_t i = 0; i < size; ++i) {
-            DistanceType diff = std::abs(a[i] - data_source.kdtree_get_pt(b_idx, i));
-            if (diff > result) result = diff;
-        }
-        return result;
-    }
-
-    template <typename U, typename V>
-    inline DistanceType accum_dist(const U a, const V b, const size_t) const {
-        return std::abs(a - b);
-    }
-};
-
-// Eigen matrix adapter for nanoflann (row-major, dynamic dims)
-struct EigenMatrixAdaptor {
-    typedef double coord_t;
-    const MatrixXd &mat;
-
-    EigenMatrixAdaptor(const MatrixXd &m) : mat(m) {}
-
-    inline size_t kdtree_get_point_count() const { return mat.rows(); }
-    inline double kdtree_get_pt(const size_t idx, const size_t dim) const {
-        return mat(idx, dim);
-    }
-
-    template <class BBOX>
-    bool kdtree_get_bbox(BBOX &) const { return false; }
-};
-
-typedef nanoflann::KDTreeSingleIndexAdaptor<
-    ChebyshevDistance<double, EigenMatrixAdaptor>,
-    EigenMatrixAdaptor,
-    -1  // dynamic dimensionality
-> kd_tree_dynamic;
-
-
-// =============================================================================
-// Helper: RMS scale (matching knnmi's MutualInformationBase::scale)
-// =============================================================================
-static void scale_column(double *col, int n, bool apply_scale, bool add_noise) {
-    if (apply_scale) {
-        double sum_sq = 0.0;
-        for (int i = 0; i < n; i++) sum_sq += col[i] * col[i];
-        double rms = std::sqrt(sum_sq / (n - 1));
-        if (rms > 0.0) {
-            for (int i = 0; i < n; i++) col[i] /= rms;
-        }
-    }
-    if (add_noise) {
-        double mean_val = 0.0;
-        for (int i = 0; i < n; i++) mean_val += col[i];
-        mean_val /= n;
-        GetRNGstate();
-        for (int i = 0; i < n; i++) {
-            col[i] += 1e-12 * mean_val * unif_rand();
-        }
-        PutRNGstate();
-    }
-}
-
-// Check if a column is integer-valued (matching knnmi's check_if_int)
+// check_if_int: same logic as MutualInformationBase::check_if_int
 static bool check_if_int(const double *col, int n) {
-    double eps = std::numeric_limits<double>::epsilon();
-    for (int i = 0; i < n; i++) {
-        int64_t ival = static_cast<int64_t>(col[i]);
-        if (std::abs(col[i] - ival) > eps) return false;
+  double eps = std::numeric_limits<double>::epsilon();
+  for (int i = 0; i < n; i++) {
+    auto ival = static_cast<std::int64_t>(col[i]);
+    if ((col[i] - ival) > eps) return false;
+  }
+  return true;
+}
+
+// scale_column: same logic as MutualInformationBase::scale
+// RMS without centering, then 1e-12 * mean * U(0,1) noise
+static void scale_column(double *col, int n, bool apply_scale) {
+  if (apply_scale) {
+    double sum_sq = 0.0;
+    for (int i = 0; i < n; i++) sum_sq += col[i] * col[i];
+    double rms = std::sqrt(sum_sq / (n - 1));
+    if (rms > 0.0) {
+      for (int i = 0; i < n; i++) col[i] /= rms;
     }
-    return true;
+  }
+  // Noise: 1e-12 * mean(scaled) * U(0,1)
+  double mean_val = 0.0;
+  for (int i = 0; i < n; i++) mean_val += col[i];
+  mean_val /= n;
+  for (int i = 0; i < n; i++) {
+    col[i] += 1e-12 * mean_val * unif_rand();
+  }
+}
+
+// Chebyshev distance between rows i and j of a column-major matrix
+// mat is n x d stored as double[n*d] in column-major order
+static inline double cheb_dist(const double *mat, int n, int d, int i, int j) {
+  double maxd = 0.0;
+  for (int dim = 0; dim < d; dim++) {
+    double diff = std::fabs(mat[dim * n + i] - mat[dim * n + j]);
+    if (diff > maxd) maxd = diff;
+  }
+  return maxd;
 }
 
 
 // =============================================================================
-// Core: mutual_inf_cc_mv_impl
-//
-// Computes MI(X; Y) where X is N x d_x and Y is N x d_y.
-// Both X and Y are passed as column-major R matrices.
+// Core implementation
 // =============================================================================
 static double mutual_inf_cc_mv_impl(
     const double *x_data, int n, int d_x,
     const double *y_data, int d_y,
     int k)
 {
-    int d_joint = d_x + d_y;
-
-    // --- Build joint matrix (N x d_joint) ---
-    MatrixXd joint(n, d_joint);
-    MatrixXd x_mat(n, d_x);
-    MatrixXd y_mat(n, d_y);
-
-    // Copy and scale X columns
-    for (int j = 0; j < d_x; j++) {
-        for (int i = 0; i < n; i++) {
-            x_mat(i, j) = x_data[j * n + i];  // column-major from R
-        }
-        bool is_int = check_if_int(x_mat.col(j).data(), n);
-        scale_column(x_mat.col(j).data(), n, !is_int, true);
-    }
-
-    // Copy and scale Y columns
-    for (int j = 0; j < d_y; j++) {
-        for (int i = 0; i < n; i++) {
-            y_mat(i, j) = y_data[j * n + i];  // column-major from R
-        }
-        bool is_int = check_if_int(y_mat.col(j).data(), n);
-        scale_column(y_mat.col(j).data(), n, !is_int, true);
-    }
-
-    // Assemble joint matrix
-    joint.leftCols(d_x) = x_mat;
-    joint.rightCols(d_y) = y_mat;
-
-    // --- Build KD-tree for joint space ---
-    EigenMatrixAdaptor joint_adaptor(joint);
-    kd_tree_dynamic joint_tree(d_joint, joint_adaptor,
-        nanoflann::KDTreeSingleIndexAdaptorParams(10));
-    joint_tree.buildIndex();
-
-    // --- Build KD-trees for marginals ---
-    EigenMatrixAdaptor x_adaptor(x_mat);
-    kd_tree_dynamic x_tree(d_x, x_adaptor,
-        nanoflann::KDTreeSingleIndexAdaptorParams(10));
-    x_tree.buildIndex();
-
-    EigenMatrixAdaptor y_adaptor(y_mat);
-    kd_tree_dynamic y_tree(d_y, y_adaptor,
-        nanoflann::KDTreeSingleIndexAdaptorParams(10));
-    y_tree.buildIndex();
-
-    // --- k-NN search in joint space ---
-    int real_k = k + 1;  // +1 to include self (distance 0)
-    std::vector<double> eps_vec(n);
-
+  int d_joint = d_x + d_y;
+  
+  // --- Allocate and populate working matrices (column-major: n x d) ---
+  // x_scaled: n * d_x, y_scaled: n * d_y, joint: n * d_joint
+  std::vector<double> x_scaled(n * d_x);
+  std::vector<double> y_scaled(n * d_y);
+  std::vector<double> joint(n * d_joint);
+  
+  // Copy X, scale each column
+  for (int j = 0; j < d_x; j++) {
     for (int i = 0; i < n; i++) {
-        std::vector<uint32_t> ret_idx(real_k);
-        std::vector<double> ret_dist(real_k);
-
-        // Query point
-        std::vector<double> query(d_joint);
-        for (int j = 0; j < d_joint; j++) query[j] = joint(i, j);
-
-        size_t found = joint_tree.knnSearch(&query[0], real_k,
-                                            &ret_idx[0], &ret_dist[0]);
-
-        // Max distance among k+1 neighbors (includes self at dist 0)
-        double max_dist = *std::max_element(ret_dist.begin(),
-                                            ret_dist.begin() + found);
-
-        // Nudge down by 1 ULP — matching knnmi's nextafter trick
-        eps_vec[i] = std::nextafter(max_dist, 0.0);
+      x_scaled[j * n + i] = x_data[j * n + i];
     }
-
-    // --- Marginal radius searches ---
-    double digamma_sum = 0.0;
-    nanoflann::SearchParams search_params(10);
-
+    bool is_int = check_if_int(&x_scaled[j * n], n);
+    scale_column(&x_scaled[j * n], n, !is_int);
+  }
+  
+  // Copy Y, scale each column
+  for (int j = 0; j < d_y; j++) {
     for (int i = 0; i < n; i++) {
-        // X marginal: radiusSearch with eps from joint space
-        std::vector<double> query_x(d_x);
-        for (int j = 0; j < d_x; j++) query_x[j] = x_mat(i, j);
-
-        std::vector<std::pair<uint32_t, double>> x_matches;
-        double n_x = x_tree.radiusSearch(&query_x[0], eps_vec[i],
-                                         x_matches, search_params);
-
-        // Y marginal: same eps
-        std::vector<double> query_y(d_y);
-        for (int j = 0; j < d_y; j++) query_y[j] = y_mat(i, j);
-
-        std::vector<std::pair<uint32_t, double>> y_matches;
-        double n_y = y_tree.radiusSearch(&query_y[0], eps_vec[i],
-                                         y_matches, search_params);
-
-        // radiusSearch returns count including self (dist 0 <= eps)
-        // so digamma(n_x) already has the +1 built in.
-        digamma_sum += Rf_digamma(n_x) + Rf_digamma(n_y);
+      y_scaled[j * n + i] = y_data[j * n + i];
     }
-
-    // MI = psi(k) + psi(N) - <psi(n_x) + psi(n_y)>
-    // where n_x, n_y include self (matching knnmi convention)
-    double mi = Rf_digamma((double)k) + Rf_digamma((double)n)
-                - digamma_sum / (double)n;
-
-    return std::max(0.0, mi);
+    bool is_int = check_if_int(&y_scaled[j * n], n);
+    scale_column(&y_scaled[j * n], n, !is_int);
+  }
+  
+  // Assemble joint = [X | Y] in column-major
+  for (int j = 0; j < d_x; j++) {
+    for (int i = 0; i < n; i++) {
+      joint[j * n + i] = x_scaled[j * n + i];
+    }
+  }
+  for (int j = 0; j < d_y; j++) {
+    for (int i = 0; i < n; i++) {
+      joint[(d_x + j) * n + i] = y_scaled[j * n + i];
+    }
+  }
+  
+  // --- Joint k-NN: find eps for each point ---
+  // Brute-force O(n^2) with true Chebyshev distance
+  std::vector<double> eps_vec(n);
+  std::vector<double> all_dists(n);
+  
+  for (int i = 0; i < n; i++) {
+    for (int j = 0; j < n; j++) {
+      if (j == i) {
+        all_dists[j] = std::numeric_limits<double>::infinity();
+      } else {
+        all_dists[j] = cheb_dist(joint.data(), n, d_joint, i, j);
+      }
+    }
+    // k-th nearest neighbor (0-indexed partial sort, k-1 for 0-based)
+    std::nth_element(all_dists.begin(), all_dists.begin() + (k - 1),
+                     all_dists.end());
+    // Nudge down by 1 ULP (matching knnmi's nextafter trick)
+    eps_vec[i] = std::nextafter(all_dists[k - 1], 0.0);
+  }
+  
+  // --- Marginal counting with true Chebyshev distance ---
+  double digamma_sum = 0.0;
+  
+  for (int i = 0; i < n; i++) {
+    double eps_i = eps_vec[i];
+    
+    // X marginal count (includes self)
+    double n_x = 1.0;  // self
+    for (int j = 0; j < n; j++) {
+      if (j == i) continue;
+      double dx = cheb_dist(x_scaled.data(), n, d_x, i, j);
+      if (dx <= eps_i) n_x += 1.0;
+    }
+    
+    // Y marginal count (includes self)
+    double n_y = 1.0;  // self
+    for (int j = 0; j < n; j++) {
+      if (j == i) continue;
+      double dy = cheb_dist(y_scaled.data(), n, d_y, i, j);
+      if (dy <= eps_i) n_y += 1.0;
+    }
+    
+    // digamma(count) — count includes self, matching knnmi
+    digamma_sum += Rf_digamma(n_x) + Rf_digamma(n_y);
+  }
+  
+  // MI = psi(k) + psi(N) - <psi(n_x) + psi(n_y)>
+  double mi = Rf_digamma((double)k) + Rf_digamma((double)n)
+    - digamma_sum / (double)n;
+  
+  return std::max(0.0, mi);
 }
 
 
 // =============================================================================
 // R-facing C wrapper
 // =============================================================================
-
 extern "C" {
-
-SEXP _mutual_inf_cc_mv(SEXP r_x, SEXP r_y, SEXP r_dx, SEXP r_dy, SEXP r_k) {
-    /*
-     * Multivariate MI: MI(X; Y)
-     *
-     * r_x  — numeric vector of length N*d_x (column-major matrix from R)
-     * r_y  — numeric vector of length N*d_y (column-major matrix from R)
-     * r_dx — integer, number of X dimensions
-     * r_dy — integer, number of Y dimensions
-     * r_k  — integer, number of nearest neighbors
-     *
-     * Returns: numeric vector of length 1 (the MI estimate)
-     */
+  
+  SEXP _mutual_inf_cc_mv(SEXP r_x, SEXP r_y, SEXP r_dx, SEXP r_dy, SEXP r_k) {
     int d_x = INTEGER(r_dx)[0];
     int d_y = INTEGER(r_dy)[0];
-    int k = INTEGER(r_k)[0];
-    int n = LENGTH(r_x) / d_x;  // N = total elements / number of columns
-
+    int k_val = INTEGER(r_k)[0];
+    int n = LENGTH(r_x) / d_x;
+    
+    GetRNGstate();
+    
     SEXP mi = PROTECT(allocVector(REALSXP, 1));
     REAL(mi)[0] = mutual_inf_cc_mv_impl(
-        REAL(r_x), n, d_x,
-        REAL(r_y), d_y,
-        k
+      REAL(r_x), n, d_x,
+      REAL(r_y), d_y,
+      k_val
     );
+    
+    PutRNGstate();
     UNPROTECT(1);
     return mi;
-}
-
+  }
+  
 } // extern "C"
