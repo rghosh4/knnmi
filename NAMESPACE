@@ -3,6 +3,8 @@
 export(cond_mutual_inf)
 export(mutual_inf_cc)
 export(mutual_inf_cd)
+export(mutual_inf_cc_mv)
 useDynLib(knnmi,"_cond_mutual_inf")
 useDynLib(knnmi,"_mutual_inf_cc")
 useDynLib(knnmi,"_mutual_inf_cd")
+useDynLib(knnmi,"_mutual_inf_cc_mv")
